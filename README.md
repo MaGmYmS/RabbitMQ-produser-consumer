@@ -24,7 +24,7 @@
 2. Установите зависимости:
 
     ```bash
-    pip install -r requirements.txt
+    pip install -requirements.txt requirements.txt
     ```
 
 3. Убедитесь, что у вас установлен и настроен RabbitMQ. Если RabbitMQ работает локально, его настройки можно оставить по умолчанию.
@@ -32,10 +32,8 @@
 4. Создайте файл `.env` и добавьте туда параметры подключения RabbitMQ (или настройте переменные окружения):
 
     ```text
-    RABBITMQ_HOST=localhost
-    RABBITMQ_PORT=5672
-    RABBITMQ_USER=guest
-    RABBITMQ_PASSWORD=guest
+    RABBITMQ_URL=amqp://guest:guest@localhost/
+    QUEUE_TIMEOUT=10
     ```
 
 ## Запуск
