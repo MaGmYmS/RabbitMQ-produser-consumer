@@ -1,66 +1,76 @@
 import asyncio
+import aiohttp
 import os
-import aio_pika
+import pika
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
 
-# Глобальная переменная для исходного таймаута
-timeout_env = int(os.getenv("QUEUE_TIMEOUT", 10))  # Таймаут в секундах
+RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
+QUEUE_NAME = "links_queue"
+PROCESSED_LINKS_FILE = "processed_links.txt"
+TIMEOUT = 10  # Таймаут в секундах, после которого консумер завершает работу
 
 
-async def process_link(link):
-    """Обработка полученной ссылки."""
-    print(f" [x] Processing link: {link}")
+def is_internal_link(base_url, link):
+    return urlparse(link).netloc == urlparse(base_url).netloc or not urlparse(link).netloc
 
 
-async def consume(queue):
-    """Потребляет сообщения из очереди с завершением при таймауте."""
-    timeout_counter = timeout_env  # Таймер для завершения при отсутствии сообщений
-
+async def fetch_links(url):
+    """Асинхронное получение всех ссылок с HTML-страницы."""
     try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    return []
+                html = await response.text()
+                soup = BeautifulSoup(html, "html.parser")
+                links = set()
+                for tag in soup.find_all("a", href=True):
+                    href = tag.get("href")
+                    full_url = urljoin(url, href)
+                    links.add(full_url)
+                return links
+    except Exception as e:
+        print(f"Error fetching links from {url}: {e}")
+        return []
+
+
+async def process_message(channel, body):
+    """Обрабатывает сообщение из очереди."""
+    url = body.decode()
+    print(f"Consumer processing: {url}")
+    links = await fetch_links(url)
+    base_url = urlparse(url).scheme + "://" + urlparse(url).netloc
+
+    for link in links:
+        if is_internal_link(base_url, link):
+            with open(PROCESSED_LINKS_FILE, "a+") as f:
+                f.seek(0)
+                if link not in f.read():
+                    f.write(link + "\n")
+                    channel.basic_publish(exchange="", routing_key=QUEUE_NAME, body=link)
+                    print(f"Consumer added to queue: {link}")
+
+
+async def consume():
+    """Запуск консумера."""
+    connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
+    channel = connection.channel()
+    channel.queue_declare(queue=QUEUE_NAME)
+
+    async def consume_queue():
         while True:
-            try:
-                # Ожидаем сообщение из очереди с заданным таймаутом
-                incoming_message = await asyncio.wait_for(queue.get(), timeout=timeout_counter)
-                async with incoming_message.process():
-                    link = incoming_message.body.decode()
-                    await process_link(link)
-
-                # Сбрасываем таймер после успешной обработки
-                timeout_counter = timeout_env
-
-            except asyncio.TimeoutError:
-                print(f" [!] No messages for {timeout_env} seconds. Exiting consumer...")
+            method_frame, _, body = channel.basic_get(queue=QUEUE_NAME, auto_ack=True)
+            if body:
+                await process_message(channel, body)
+            else:
+                print("Queue is empty, waiting...")
+                await asyncio.sleep(TIMEOUT)
                 break
-            except aio_pika.exceptions.QueueEmpty:
-                print(" [!] Queue is empty. Waiting...")
-                await asyncio.sleep(1)  # Короткая пауза перед повторной проверкой
-                timeout_counter -= 1
-                if timeout_counter <= 0:
-                    print(f" [!] Timeout of {timeout_env} seconds reached. Exiting consumer...")
-                    break
-            except Exception as e:
-                print(f" [!] Error during message processing: {e}")
-                break
-    except asyncio.CancelledError:
-        print(" [!] Consumer cancelled.")
-    except Exception as e:
-        print(f" [!] Unexpected error in consumer: {e}")
 
-
-async def main():
-    """Основная функция."""
-    rabbitmq_url = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost/")
-
-    try:
-        connection = await aio_pika.connect_robust(rabbitmq_url)
-        async with connection:
-            channel = await connection.channel()
-            queue = await channel.declare_queue("link_queue", durable=False)
-
-            print(" [*] Waiting for messages...")
-            await consume(queue)
-    except Exception as e:
-        print(f" [!] Error in main function: {e}")
+    await consume_queue()
+    connection.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(consume())
